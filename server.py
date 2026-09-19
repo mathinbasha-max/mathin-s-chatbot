@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
-import requests
 from flask_cors import CORS
+import requests
+import os
 
 app = Flask(__name__)
 CORS(app)
@@ -10,18 +11,33 @@ def chat():
     data = request.get_json()
     question = data.get("message", "")
 
+    api_key = os.environ.get("GEMINI_API_KEY")
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+
     response = requests.post(
-        "http://127.0.0.1:11434/api/generate",
+        url,
+        headers={
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json"
+        },
         json={
-            "model": "llama3.2",
-            "prompt": question,
-            "stream": False
+            "contents": [
+                {
+                    "parts": [
+                        {"text": question}
+                    ]
+                }
+            ]
         }
     )
 
-    answer = response.json()["response"]
+    result = response.json()
+
+    answer = result["candidates"][0]["content"]["parts"][0]["text"]
 
     return jsonify({"reply": answer})
 
+
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    app.run()
