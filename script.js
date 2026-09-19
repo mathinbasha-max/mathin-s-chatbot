@@ -19,7 +19,7 @@ async function sendMessage() {
 
     // Send to Python
     try {
-        const response = await fetch("http:/chat", {
+        const response = await fetch("/chat", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json"
