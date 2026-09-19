@@ -1,7 +1,14 @@
 import streamlit as st
 import requests
 
-st.title("🤖 My LLM Chatbot")
+st.set_page_config(
+    page_title="My AI Chatbot",
+    page_icon="🤖",
+    layout="centered"
+)
+
+st.title("🤖 My AI Chatbot")
+st.caption("Powered by Llama 3.2 + Ollama")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -18,10 +25,17 @@ if question:
         "content": question
     })
 
-    prompt = "\n".join(
+    with st.chat_message("user"):
+        st.write(question)
+
+    prompt = """
+You are a helpful and friendly AI assistant.
+
+Conversation:
+""" + "\n".join(
         f"{m['role']}: {m['content']}"
         for m in st.session_state.messages
-    )
+    ) + "\nassistant:"
 
     response = requests.post(
         "http://localhost:11434/api/generate",
@@ -32,11 +46,12 @@ if question:
         }
     )
 
-    answer = response.json()["response"]
+    answer = response.json()["response"].strip()
 
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer
     })
 
-    st.rerun()
+    with st.chat_message("assistant"):
+        st.write(answer)
