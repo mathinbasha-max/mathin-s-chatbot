@@ -1,14 +1,14 @@
 import streamlit as st
-import requests
+from google import genai
 
-st.set_page_config(
-    page_title="My AI Chatbot",
-    page_icon="🤖",
-    layout="centered"
-)
+st.set_page_config(page_title="My AI Chatbot")
 
 st.title("🤖 My AI Chatbot")
-st.caption("Powered by Llama 3.2 + Ollama")
+st.caption("Powered by Gemini")
+
+client = genai.Client(
+    api_key=st.secrets["GEMINI_API_KEY"]
+)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -28,25 +28,12 @@ if question:
     with st.chat_message("user"):
         st.write(question)
 
-    prompt = """
-You are a helpful and friendly AI assistant.
-
-Conversation:
-""" + "\n".join(
-        f"{m['role']}: {m['content']}"
-        for m in st.session_state.messages
-    ) + "\nassistant:"
-
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "llama3.2",
-            "prompt": prompt,
-            "stream": False
-        }
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=question
     )
 
-    answer = response.json()["response"].strip()
+    answer = response.text
 
     st.session_state.messages.append({
         "role": "assistant",
