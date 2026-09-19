@@ -50,6 +50,8 @@ def chat():
 
     result = response.json()
 
+    print("GEMINI RESPONSE:", result)
+    
     answer = result["candidates"][0]["content"]["parts"][0]["text"]
 
     return jsonify({"reply": answer})
