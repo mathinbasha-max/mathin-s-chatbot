@@ -6,6 +6,9 @@ import os
 app = Flask(__name__)
 CORS(app)
 
+@app.route("/")
+def home():
+    return "My AI Chatbot Server is Running!"
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
