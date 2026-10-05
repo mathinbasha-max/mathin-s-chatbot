@@ -1,71 +1,74 @@
 from flask import Flask, request, jsonify, send_from_directory, make_response
 from flask_cors import CORS
-from supabase import create_client, Client
 import requests
 import os
-import time
 import uuid
 import re
-import dateparser
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from supabase import create_client
+import dateparser
+from dateparser.search import search_dates
+from dotenv import load_dotenv
+
+
+# =========================================================
+# LOAD .ENV FILE
+# =========================================================
+
+load_dotenv()
+
+
+# =========================================================
+# APP SETUP
+# =========================================================
 
 app = Flask(__name__)
 CORS(app)
 
+IST = ZoneInfo("Asia/Kolkata")
+
+
 # =========================================================
-# TIMEZONE
+# ENVIRONMENT VARIABLES
 # =========================================================
 
-INDIA_TZ = ZoneInfo("Asia/Kolkata")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 
 # =========================================================
 # SUPABASE CONNECTION
 # =========================================================
 
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_KEY")
-
-if not supabase_url or not supabase_key:
+if not SUPABASE_URL or not SUPABASE_KEY:
     print("WARNING: Supabase environment variables are missing.")
-    supabase = None
-else:
-    supabase: Client = create_client(
-        supabase_url,
-        supabase_key
+
+supabase = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(
+        SUPABASE_URL,
+        SUPABASE_KEY
     )
 
 
 # =========================================================
-# HOME PAGE
+# GEMINI
 # =========================================================
 
-@app.route("/")
-def home():
-    return send_from_directory(".", "index.html")
+GEMINI_MODEL = "gemini-3.6-flash"
 
-
-# =========================================================
-# CSS
-# =========================================================
-
-@app.route("/style.css")
-def style():
-    return send_from_directory(".", "style.css")
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
 
 # =========================================================
-# JAVASCRIPT
-# =========================================================
-
-@app.route("/script.js")
-def script():
-    return send_from_directory(".", "script.js")
-
-
-# =========================================================
-# GET OR CREATE USER ID
+# USER ID
 # =========================================================
 
 def get_user_id():
@@ -79,7 +82,7 @@ def get_user_id():
 
 
 # =========================================================
-# GET CHAT HISTORY
+# CHAT MEMORY
 # =========================================================
 
 def get_chat_history(user_id):
@@ -92,7 +95,7 @@ def get_chat_history(user_id):
         result = (
             supabase
             .table("chat_memory")
-            .select("role, message, created_at")
+            .select("*")
             .eq("user_id", user_id)
             .order("created_at", desc=False)
             .limit(30)
@@ -103,20 +106,15 @@ def get_chat_history(user_id):
 
     except Exception as e:
 
-        print("SUPABASE READ ERROR:", e)
+        print("Memory read error:", e)
 
         return []
 
 
-# =========================================================
-# SAVE CHAT MESSAGE
-# =========================================================
-
 def save_message(user_id, role, message):
 
     if not supabase:
-        print("Supabase is not connected.")
-        return False
+        return
 
     try:
 
@@ -126,13 +124,9 @@ def save_message(user_id, role, message):
             "message": message
         }).execute()
 
-        return True
-
     except Exception as e:
 
-        print("SUPABASE SAVE ERROR:", e)
-
-        return False
+        print("Memory save error:", e)
 
 
 # =========================================================
@@ -147,49 +141,55 @@ def save_reminder(
 ):
 
     if not supabase:
-        print("Supabase is not connected.")
-        return False
+        return None
 
     try:
 
-        supabase.table("reminders").insert({
+        result = (
+            supabase
+            .table("reminders")
+            .insert({
+                "user_id": user_id,
+                "reminder_text": reminder_text,
+                "reminder_date": reminder_date,
+                "reminder_time": reminder_time,
+                "completed": False,
+                "notification_sent": False
+            })
+            .execute()
+        )
 
-            "user_id": user_id,
-            "reminder_text": reminder_text,
-            "reminder_date": reminder_date,
-            "reminder_time": reminder_time,
-            "completed": False
+        if result.data:
+            return result.data[0]
 
-        }).execute()
-
-        return True
+        return None
 
     except Exception as e:
 
-        print("SUPABASE REMINDER SAVE ERROR:", e)
+        print("Reminder save error:", e)
 
-        return False
+        return None
 
 
 # =========================================================
 # CHECK REMINDER REQUEST
 # =========================================================
 
-def is_reminder_request(question):
+def is_reminder_request(message):
 
-    text = question.lower().strip()
+    message_lower = message.lower().strip()
 
-    reminder_patterns = [
-        r"\bremind me\b",
-        r"\bcan you remind me\b",
-        r"\bplease remind me\b",
-        r"\bset a reminder\b",
-        r"\bset reminder\b"
+    reminder_words = [
+        "remind me",
+        "reminder",
+        "set a reminder",
+        "set reminder",
+        "remind"
     ]
 
-    for pattern in reminder_patterns:
+    for word in reminder_words:
 
-        if re.search(pattern, text):
+        if word in message_lower:
             return True
 
     return False
@@ -201,323 +201,497 @@ def is_reminder_request(question):
 
 def extract_time(text):
 
-    # Supports:
+    text_lower = text.lower()
+
+    # 12 hour format
     # 7 PM
     # 7:30 PM
     # 7.30 PM
-    # 07:30 PM
+
+    pattern_12 = r"\b(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)\b"
+
+    match = re.search(
+        pattern_12,
+        text_lower
+    )
+
+    if match:
+
+        hour = int(match.group(1))
+
+        minute = int(
+            match.group(2) or 0
+        )
+
+        period = match.group(3)
+
+        if hour < 1 or hour > 12:
+            return None
+
+        if minute < 0 or minute > 59:
+            return None
+
+        if period == "pm" and hour != 12:
+            hour += 12
+
+        if period == "am" and hour == 12:
+            hour = 0
+
+        return f"{hour:02d}:{minute:02d}:00"
+
+
+    # 24 hour format
     # 19:30
-    # 7.30
+    # 19.30
 
-    time_pattern = re.compile(
-        r"\b("
-        r"(?:[0-1]?\d|2[0-3])"
-        r"(?:\s*[:.]\s*[0-5]\d)?"
-        r"\s*(?:AM|PM|am|pm)?"
-        r")\b"
+    pattern_24 = r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b"
+
+    match = re.search(
+        pattern_24,
+        text_lower
     )
 
-    match = time_pattern.search(text)
+    if match:
 
-    if not match:
-        return None, None
+        hour = int(match.group(1))
+        minute = int(match.group(2))
 
-    time_text = match.group(1).strip()
+        return f"{hour:02d}:{minute:02d}:00"
 
-    # Convert 7.30 → 7:30
-    normalized_time = time_text.replace(".", ":")
 
-    # If AM/PM is missing
-    # dateparser can still understand common values
-    parsed_time = dateparser.parse(
-        normalized_time,
-        settings={
-            "RETURN_AS_TIMEZONE_AWARE": False
-        }
+    return None
+
+
+# =========================================================
+# EXTRACT DATE
+# =========================================================
+
+def extract_date(text):
+
+    text_lower = text.lower()
+
+    today = datetime.now(IST).date()
+
+
+    # TODAY
+
+    if re.search(r"\btoday\b", text_lower):
+        return today
+
+
+    # DAY AFTER TOMORROW
+    # This must come BEFORE tomorrow.
+
+    if re.search(
+        r"\bday after tomorrow\b",
+        text_lower
+    ):
+        return today + timedelta(days=2)
+
+
+    # TOMORROW
+
+    if re.search(
+        r"\btomorrow\b",
+        text_lower
+    ):
+        return today + timedelta(days=1)
+
+
+    # WEEKDAYS
+
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6
+    }
+
+
+    # NEXT MONDAY etc.
+
+    match = re.search(
+        r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        text_lower
     )
 
-    if not parsed_time:
-        return None, None
+    if match:
 
-    return match, parsed_time
+        target_day = weekdays[
+            match.group(1)
+        ]
+
+        current_day = today.weekday()
+
+        days_ahead = (
+            target_day - current_day
+        ) % 7
+
+        if days_ahead == 0:
+            days_ahead = 7
+
+        return today + timedelta(
+            days=days_ahead
+        )
+
+
+    # THIS MONDAY etc.
+
+    match = re.search(
+        r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        text_lower
+    )
+
+    if match:
+
+        target_day = weekdays[
+            match.group(1)
+        ]
+
+        current_day = today.weekday()
+
+        days_ahead = (
+            target_day - current_day
+        ) % 7
+
+        return today + timedelta(
+            days=days_ahead
+        )
+
+
+    # DATEPARSER
+
+    try:
+
+        results = search_dates(
+            text,
+            languages=["en"],
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": datetime.now(IST)
+            }
+        )
+
+        if results:
+
+            for found_text, parsed_date in results:
+
+                lower_found = (
+                    found_text.lower().strip()
+                )
+
+                if re.fullmatch(
+                    r"\d{1,2}([:.]\d{2})?\s*(am|pm)?",
+                    lower_found
+                ):
+                    continue
+
+                return parsed_date.date()
+
+    except Exception as e:
+
+        print(
+            "Date parsing error:",
+            e
+        )
+
+
+    return None
 
 
 # =========================================================
 # EXTRACT REMINDER
 # =========================================================
 
-def extract_reminder(question):
+def extract_reminder(message):
+
+    reminder_date = extract_date(
+        message
+    )
+
+    reminder_time = extract_time(
+        message
+    )
+
+    if not reminder_date or not reminder_time:
+        return None
+
+
+    text = message.strip()
+
+
+    # Remove beginning phrases
+
+    text = re.sub(
+        r"^\s*can\s+you\s+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^\s*please\s+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^\s*remind\s+me\s+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^\s*set\s+(?:a\s+)?reminder\s+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+
+    # Remove date phrases
+
+    date_patterns = [
+
+        r"\bday after tomorrow\b",
+
+        r"\btomorrow\b",
+
+        r"\btoday\b",
+
+        r"\bnext\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+
+        r"\bthis\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    ]
+
+
+    for pattern in date_patterns:
+
+        text = re.sub(
+            pattern,
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
+
+
+    # Remove time
+
+    text = re.sub(
+        r"\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+
+    # Remove connecting words
+
+    text = re.sub(
+        r"^\s*(at|on)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^\s*to\s+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^\s*for\s+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+
+    # Clean spaces
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+    text = text.strip(
+        " ,.-"
+    )
+
+
+    if not text:
+
+        text = "Complete the reminder"
+
+
+    return {
+
+        "text": text,
+
+        "date": reminder_date.isoformat(),
+
+        "time": reminder_time
+    }
+
+
+# =========================================================
+# GET DUE REMINDERS
+# =========================================================
+
+def get_due_reminders():
+
+    if not supabase:
+        return []
 
     try:
 
-        now = datetime.now(INDIA_TZ)
+        now = datetime.now(IST)
 
-        original = question.strip()
+        today = now.date().isoformat()
 
-        # -------------------------------------------------
-        # Remove reminder command
-        # -------------------------------------------------
-
-        cleaned = re.sub(
-            r"^\s*(?:can you\s+|please\s+)?"
-            r"(?:remind me|set a reminder|set reminder)"
-            r"\s*",
-            "",
-            original,
-            flags=re.IGNORECASE
-        ).strip()
-
-
-        # -------------------------------------------------
-        # Find time
-        # -------------------------------------------------
-
-        time_match, parsed_time = extract_time(cleaned)
-
-        if not time_match:
-
-            return None
-
-        time_text = time_match.group(1)
-
-        # -------------------------------------------------
-        # Remove time from sentence
-        # -------------------------------------------------
-
-        without_time = (
-            cleaned[:time_match.start()]
-            + " "
-            + cleaned[time_match.end():]
-        ).strip()
-
-
-        # -------------------------------------------------
-        # Find date words
-        # -------------------------------------------------
-
-        date_patterns = [
-            r"\btoday\b",
-            r"\btomorrow\b",
-            r"\bday after tomorrow\b",
-            r"\bnext\s+(?:monday|tuesday|wednesday|"
-            r"thursday|friday|saturday|sunday)\b",
-            r"\bthis\s+(?:monday|tuesday|wednesday|"
-            r"thursday|friday|saturday|sunday)\b",
-            r"\bon\s+\d{1,2}(?:st|nd|rd|th)?\s+"
-            r"(?:january|february|march|april|may|june|"
-            r"july|august|september|october|november|december)\b",
-            r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
-        ]
-
-        date_text = None
-        date_match = None
-
-        for pattern in date_patterns:
-
-            match = re.search(
-                pattern,
-                without_time,
-                flags=re.IGNORECASE
-            )
-
-            if match:
-
-                date_match = match
-                date_text = match.group(0)
-                break
-
-
-        # -------------------------------------------------
-        # If no date specified, use today
-        # -------------------------------------------------
-
-        if date_text:
-
-            parsed_date = dateparser.parse(
-                date_text,
-                settings={
-                    "RELATIVE_BASE": now,
-                    "PREFER_DATES_FROM": "future"
-                }
-            )
-
-        else:
-
-            parsed_date = now
-
-
-        if not parsed_date:
-
-            return None
-
-
-        # -------------------------------------------------
-        # Combine date + time
-        # -------------------------------------------------
-
-        hour = parsed_time.hour
-        minute = parsed_time.minute
-
-
-        # Detect AM/PM manually
-        if re.search(r"\bPM\b", time_text, re.IGNORECASE):
-
-            if hour < 12:
-                hour += 12
-
-        elif re.search(r"\bAM\b", time_text, re.IGNORECASE):
-
-            if hour == 12:
-                hour = 0
-
-        else:
-
-            # No AM/PM.
-            # Keep entered hour as-is.
-
-            pass
-
-
-        reminder_datetime = datetime(
-            parsed_date.year,
-            parsed_date.month,
-            parsed_date.day,
-            hour,
-            minute,
-            0,
-            tzinfo=INDIA_TZ
+        current_time = now.strftime(
+            "%H:%M:%S"
         )
 
 
-        # -------------------------------------------------
-        # If "today" time already passed,
-        # don't silently create a past reminder.
-        # -------------------------------------------------
-
-        if reminder_datetime <= now:
-
-            if date_text and date_text.lower() == "today":
-
-                return None
-
-
-        # -------------------------------------------------
-        # Remove date from task text
-        # -------------------------------------------------
-
-        task_text = without_time
-
-        if date_match:
-
-            task_text = (
-                task_text[:date_match.start()]
-                + " "
-                + task_text[date_match.end():]
+        result = (
+            supabase
+            .table("reminders")
+            .select("*")
+            .eq(
+                "reminder_date",
+                today
             )
-
-
-        # -------------------------------------------------
-        # Remove common words
-        # -------------------------------------------------
-
-        task_text = re.sub(
-            r"^\s*(?:at|on|for|to)\s+",
-            "",
-            task_text,
-            flags=re.IGNORECASE
+            .eq(
+                "notification_sent",
+                False
+            )
+            .eq(
+                "completed",
+                False
+            )
+            .lte(
+                "reminder_time",
+                current_time
+            )
+            .execute()
         )
 
-        task_text = re.sub(
-            r"\b(?:at|on)\s*$",
-            "",
-            task_text,
-            flags=re.IGNORECASE
-        )
 
-        task_text = task_text.strip(" ,.-")
-
-
-        # -------------------------------------------------
-        # Remove leading "to"
-        # -------------------------------------------------
-
-        if task_text.lower().startswith("to "):
-
-            task_text = task_text[3:].strip()
-
-
-        # -------------------------------------------------
-        # If task is empty
-        # -------------------------------------------------
-
-        if not task_text:
-
-            task_text = "Reminder"
-
-
-        return {
-
-            "text": task_text,
-
-            "date": reminder_datetime.strftime(
-                "%Y-%m-%d"
-            ),
-
-            "time": reminder_datetime.strftime(
-                "%H:%M:%S"
-            ),
-
-            "datetime": reminder_datetime
-
-        }
+        return result.data or []
 
 
     except Exception as e:
 
         print(
-            "REMINDER PARSING ERROR:",
+            "Due reminder error:",
             e
         )
 
-        return None
+        return []
 
 
 # =========================================================
-# CREATE RESPONSE WITH COOKIE
+# MARK NOTIFICATION SENT
 # =========================================================
 
-def create_response(user_id, answer):
+def mark_notification_sent(
+    reminder_id
+):
 
-    response = make_response(
-        jsonify({
-            "reply": answer
-        })
+    if not supabase:
+        return False
+
+    try:
+
+        (
+            supabase
+            .table("reminders")
+            .update({
+                "notification_sent": True
+            })
+            .eq(
+                "id",
+                reminder_id
+            )
+            .execute()
+        )
+
+        return True
+
+
+    except Exception as e:
+
+        print(
+            "Notification update error:",
+            e
+        )
+
+        return False
+
+
+# =========================================================
+# HOME PAGE
+# =========================================================
+
+@app.route("/")
+def home():
+
+    return send_from_directory(
+        ".",
+        "index.html"
     )
 
-    response.set_cookie(
 
-        "chat_user_id",
+# =========================================================
+# CSS
+# =========================================================
 
-        user_id,
+@app.route("/style.css")
+def css():
 
-        max_age=60 * 60 * 24 * 365 * 5,
-
-        httponly=True,
-
-        samesite="Lax",
-
-        secure=True
-
+    return send_from_directory(
+        ".",
+        "style.css"
     )
 
-    return response
+
+# =========================================================
+# JAVASCRIPT
+# =========================================================
+
+@app.route("/script.js")
+def javascript():
+
+    return send_from_directory(
+        ".",
+        "script.js"
+    )
 
 
 # =========================================================
-# CHAT API
+# CHAT
 # =========================================================
 
-@app.route("/chat", methods=["POST"])
+@app.route(
+    "/chat",
+    methods=["POST"]
+)
 def chat():
 
     try:
@@ -527,166 +701,164 @@ def chat():
         if not data:
 
             return jsonify({
-                "reply": "Please enter a message."
-            }), 400
+                "reply":
+                "Please enter a message."
+            })
 
 
-        question = data.get(
-            "message",
-            ""
+        message = str(
+            data.get(
+                "message",
+                ""
+            )
         ).strip()
 
 
-        if not question:
+        if not message:
 
             return jsonify({
-                "reply": "Please enter a message."
-            }), 400
+                "reply":
+                "Please enter a message."
+            })
 
-
-        # -------------------------------------------------
-        # USER ID
-        # -------------------------------------------------
 
         user_id = get_user_id()
 
 
         # =================================================
-        # REMINDER REQUEST
+        # REMINDER
         # =================================================
 
-        if is_reminder_request(question):
+        if is_reminder_request(
+            message
+        ):
 
-            reminder = extract_reminder(question)
+            reminder = extract_reminder(
+                message
+            )
 
 
-            # -------------------------------------------------
-            # Reminder could not be understood
-            # -------------------------------------------------
+            if reminder:
 
-            if not reminder:
+                saved = save_reminder(
 
-                answer = (
-                    "I couldn't understand the reminder "
-                    "date or time.\n\n"
-                    "Try something like:\n"
-                    "\"Remind me tomorrow at 10 AM "
-                    "to submit my assignment.\"\n\n"
-                    "You can also use:\n"
-                    "\"Remind me today at 8.30 PM "
-                    "to call my grandmother.\""
+                    user_id=user_id,
+
+                    reminder_text=reminder[
+                        "text"
+                    ],
+
+                    reminder_date=reminder[
+                        "date"
+                    ],
+
+                    reminder_time=reminder[
+                        "time"
+                    ]
                 )
 
 
-                save_message(
-                    user_id,
-                    "user",
-                    question
-                )
+                if saved:
 
-                save_message(
-                    user_id,
-                    "assistant",
-                    answer
-                )
+                    reply = (
 
+                        "✅ Reminder saved!\n\n"
 
-                return create_response(
-                    user_id,
-                    answer
-                )
+                        f"📝 {reminder['text']}\n"
+
+                        f"📅 {reminder['date']}\n"
+
+                        f"⏰ {reminder['time'][:5]}"
+                    )
 
 
-            # -------------------------------------------------
-            # SAVE REMINDER
-            # -------------------------------------------------
+                    save_message(
+                        user_id,
+                        "user",
+                        message
+                    )
 
-            saved = save_reminder(
+                    save_message(
+                        user_id,
+                        "assistant",
+                        reply
+                    )
 
+
+                    response = make_response(
+                        jsonify({
+                            "reply": reply
+                        })
+                    )
+
+
+                    response.set_cookie(
+                        "chat_user_id",
+                        user_id,
+                        max_age=60 * 60 * 24 * 365,
+                        httponly=True,
+                        samesite="Lax",
+                        secure=request.is_secure
+                    )
+
+
+                    return response
+
+
+            # Missing date/time
+
+            reply = (
+
+                "⏰ I can set the reminder, "
+                "but I need both the date and time.\n\n"
+
+                "Example:\n"
+
+                "Remind me tomorrow at 10 AM "
+                "to submit my assignment."
+            )
+
+
+            response = make_response(
+                jsonify({
+                    "reply": reply
+                })
+            )
+
+
+            response.set_cookie(
+                "chat_user_id",
                 user_id,
-
-                reminder["text"],
-
-                reminder["date"],
-
-                reminder["time"]
-
+                max_age=60 * 60 * 24 * 365,
+                httponly=True,
+                samesite="Lax",
+                secure=request.is_secure
             )
 
 
-            if not saved:
-
-                answer = (
-                    "I understood your reminder, "
-                    "but I couldn't save it to the database."
-                )
-
-                return create_response(
-                    user_id,
-                    answer
-                )
-
-
-            # -------------------------------------------------
-            # DISPLAY DATE/TIME
-            # -------------------------------------------------
-
-            display_datetime = (
-                reminder["datetime"]
-                .strftime(
-                    "%d %b %Y at %I:%M %p"
-                )
-            )
-
-
-            answer = (
-                "✅ Reminder saved successfully!\n\n"
-                f"📝 {reminder['text']}\n"
-                f"⏰ {display_datetime}"
-            )
-
-
-            # -------------------------------------------------
-            # SAVE TO CHAT MEMORY
-            # -------------------------------------------------
-
-            save_message(
-                user_id,
-                "user",
-                question
-            )
-
-            save_message(
-                user_id,
-                "assistant",
-                answer
-            )
-
-
-            return create_response(
-                user_id,
-                answer
-            )
+            return response
 
 
         # =================================================
-        # NORMAL AI CHAT
+        # NORMAL CHAT
         # =================================================
 
-        history = get_chat_history(user_id)
+        history = get_chat_history(
+            user_id
+        )
 
 
-        conversation_text = ""
+        conversation = ""
 
 
         for item in history:
 
             role = item.get(
                 "role",
-                ""
+                "user"
             )
 
-            message = item.get(
+            msg = item.get(
                 "message",
                 ""
             )
@@ -694,300 +866,437 @@ def chat():
 
             if role == "user":
 
-                conversation_text += (
-                    "User: "
-                    + message
-                    + "\n"
+                conversation += (
+                    f"User: {msg}\n"
                 )
 
-            elif role == "assistant":
+            else:
 
-                conversation_text += (
-                    "Assistant: "
-                    + message
-                    + "\n"
+                conversation += (
+                    f"Assistant: {msg}\n"
                 )
 
 
-        # -------------------------------------------------
-        # GEMINI PROMPT
-        # -------------------------------------------------
+        system_instruction = """
 
-        prompt = f"""
-You are a helpful AI chatbot.
+You are a helpful personal AI assistant.
 
-You have access to the previous conversation with this user.
+Your name is My AI Assistant.
 
-Use previous information when it is relevant.
+Give clear, useful and friendly answers.
 
-Previous conversation:
-{conversation_text}
+Remember information from the conversation
+when it is available.
 
-Current user message:
-{question}
+If the user asks a simple question,
+answer simply.
 
-Answer the current user message naturally and accurately.
+If the user asks for coding help,
+explain step by step.
+
+Do not say that you cannot remember something
+if the information is available in the conversation history.
+
 """
 
 
-        # -------------------------------------------------
-        # GEMINI API KEY
-        # -------------------------------------------------
+        prompt = (
 
-        api_key = os.environ.get(
-            "GEMINI_API_KEY"
+            system_instruction
+
+            + "\n\n"
+
+            + conversation
+
+            + "\nUser: "
+
+            + message
+
+            + "\nAssistant:"
         )
 
 
-        if not api_key:
+        if not GEMINI_API_KEY:
 
-            return jsonify({
-
-                "reply":
-                "Gemini API key is not configured "
-                "on the server."
-
-            }), 500
-
-
-        # -------------------------------------------------
-        # GEMINI URL
-        # -------------------------------------------------
-
-        url = (
-            "https://generativelanguage.googleapis.com/"
-            "v1beta/models/"
-            "gemini-3.6-flash:"
-            "generateContent"
-        )
-
-
-        payload = {
-
-            "contents": [
-
-                {
-
-                    "parts": [
-
-                        {
-                            "text": prompt
-                        }
-
-                    ]
-
-                }
-
-            ]
-
-        }
-
-
-        # =================================================
-        # TRY GEMINI UP TO 3 TIMES
-        # =================================================
-
-        for attempt in range(3):
-
-            response = requests.post(
-
-                url,
-
-                headers={
-
-                    "x-goog-api-key":
-                    api_key,
-
-                    "Content-Type":
-                    "application/json"
-
-                },
-
-                json=payload,
-
-                timeout=60
-
+            reply = (
+                "❌ Gemini API key is not "
+                "configured on the server."
             )
 
 
-            result = response.json()
+        else:
+
+            payload = {
+
+                "contents": [
+
+                    {
+
+                        "parts": [
+
+                            {
+
+                                "text":
+                                prompt
+
+                            }
+
+                        ]
+
+                    }
+
+                ]
+
+            }
 
 
-            print(
-                "GEMINI RESPONSE:",
-                result
-            )
+            reply = None
 
 
-            # -------------------------------------------------
-            # SUCCESS
-            # -------------------------------------------------
-
-            if "candidates" in result:
+            for attempt in range(3):
 
                 try:
 
-                    answer = (
-                        result["candidates"][0]
-                        ["content"]
-                        ["parts"][0]
-                        ["text"]
-                    ).strip()
+                    response = requests.post(
 
+                        GEMINI_URL,
 
-                    save_message(
-                        user_id,
-                        "user",
-                        question
+                        headers={
+
+                            "Content-Type":
+                            "application/json",
+
+                            "x-goog-api-key":
+                            GEMINI_API_KEY
+
+                        },
+
+                        json=payload,
+
+                        timeout=90
                     )
 
 
-                    save_message(
-                        user_id,
-                        "assistant",
-                        answer
+                    if response.status_code == 200:
+
+                        result = response.json()
+
+
+                        candidates = result.get(
+                            "candidates",
+                            []
+                        )
+
+
+                        if candidates:
+
+                            parts = (
+
+                                candidates[0]
+
+                                .get(
+                                    "content",
+                                    {}
+                                )
+
+                                .get(
+                                    "parts",
+                                    []
+                                )
+                            )
+
+
+                            if parts:
+
+                                reply = (
+                                    parts[0]
+                                    .get(
+                                        "text",
+                                        ""
+                                    )
+                                    .strip()
+                                )
+
+
+                        if not reply:
+
+                            reply = (
+                                "I received an empty "
+                                "response from the AI."
+                            )
+
+                        break
+
+
+                    elif response.status_code == 503:
+
+                        print(
+                            f"Gemini busy. "
+                            f"Attempt {attempt + 1}/3"
+                        )
+
+
+                        if attempt < 2:
+
+                            time.sleep(3)
+
+
+                        continue
+
+
+                    else:
+
+                        print(
+                            "Gemini error:",
+                            response.status_code,
+                            response.text
+                        )
+
+
+                        reply = (
+                            "❌ Gemini API error. "
+                            "Please try again."
+                        )
+
+                        break
+
+
+                except requests.exceptions.Timeout:
+
+                    print(
+                        f"Gemini timeout. "
+                        f"Attempt {attempt + 1}/3"
                     )
 
 
-                    return create_response(
-                        user_id,
-                        answer
+                    if attempt < 2:
+
+                        time.sleep(2)
+
+                    else:
+
+                        reply = (
+                            "⏳ The AI took too long "
+                            "to respond. Please try again."
+                        )
+
+
+                except Exception as e:
+
+                    print(
+                        "Gemini connection error:",
+                        e
                     )
 
 
-                except (
-                    KeyError,
-                    IndexError,
-                    TypeError
-                ):
+                    reply = (
+                        "❌ Unable to connect "
+                        "to the AI service."
+                    )
 
-                    return jsonify({
-
-                        "reply":
-                        "Gemini returned an "
-                        "unexpected response."
-
-                    }), 500
+                    break
 
 
-            # -------------------------------------------------
-            # 503 RETRY
-            # -------------------------------------------------
+        # =================================================
+        # SAVE CHAT
+        # =================================================
 
-            if response.status_code == 503:
-
-                print(
-                    f"Gemini is busy. "
-                    f"Retry attempt "
-                    f"{attempt + 1}/3"
-                )
-
-                time.sleep(
-                    2 ** attempt
-                )
-
-                continue
-
-
-            # -------------------------------------------------
-            # OTHER GEMINI ERROR
-            # -------------------------------------------------
-
-            error_message = (
-
-                result
-                .get("error", {})
-                .get(
-                    "message",
-                    "Unknown Gemini API error"
-                )
-
-            )
-
-
-            print(
-                "GEMINI ERROR:",
-                error_message
-            )
-
-
-            return jsonify({
-
-                "reply":
-                "AI server error: "
-                + error_message
-
-            }), 500
-
-
-        # -------------------------------------------------
-        # ALL RETRIES FAILED
-        # -------------------------------------------------
-
-        return jsonify({
-
-            "reply":
-            "The AI server is temporarily busy. "
-            "Please try again in a few seconds."
-
-        }), 503
-
-
-    # =====================================================
-    # TIMEOUT
-    # =====================================================
-
-    except requests.exceptions.Timeout:
-
-        return jsonify({
-
-            "reply":
-            "The AI server took too long to respond. "
-            "Please try again."
-
-        }), 504
-
-
-    # =====================================================
-    # REQUEST ERROR
-    # =====================================================
-
-    except requests.exceptions.RequestException as e:
-
-        print(
-            "REQUEST ERROR:",
-            e
+        save_message(
+            user_id,
+            "user",
+            message
         )
 
-        return jsonify({
+        save_message(
+            user_id,
+            "assistant",
+            reply
+        )
 
-            "reply":
-            "Unable to connect to the AI server."
 
-        }), 500
+        # =================================================
+        # RESPONSE
+        # =================================================
+
+        response = make_response(
+            jsonify({
+                "reply": reply
+            })
+        )
 
 
-    # =====================================================
-    # OTHER ERROR
-    # =====================================================
+        response.set_cookie(
+            "chat_user_id",
+            user_id,
+            max_age=60 * 60 * 24 * 365,
+            httponly=True,
+            samesite="Lax",
+            secure=request.is_secure
+        )
+
+
+        return response
+
 
     except Exception as e:
 
         print(
-            "SERVER ERROR:",
+            "Chat route error:",
             e
         )
+
 
         return jsonify({
 
             "reply":
-            "Something went wrong on the server."
+            "❌ Something went wrong "
+            "on the server."
 
         }), 500
 
 
 # =========================================================
-# START SERVER
+# CHECK DUE REMINDERS
+# =========================================================
+
+@app.route(
+    "/check-reminders",
+    methods=["GET"]
+)
+def check_reminders():
+
+    try:
+
+        due_reminders = (
+            get_due_reminders()
+        )
+
+
+        reminders_to_send = []
+
+
+        for reminder in due_reminders:
+
+            reminders_to_send.append({
+
+                "id":
+                reminder.get("id"),
+
+                "user_id":
+                reminder.get("user_id"),
+
+                "text":
+                reminder.get(
+                    "reminder_text"
+                ),
+
+                "date":
+                reminder.get(
+                    "reminder_date"
+                ),
+
+                "time":
+                reminder.get(
+                    "reminder_time"
+                )
+
+            })
+
+
+        return jsonify({
+
+            "success": True,
+
+            "count":
+            len(reminders_to_send),
+
+            "reminders":
+            reminders_to_send
+
+        })
+
+
+    except Exception as e:
+
+        print(
+            "Check reminders error:",
+            e
+        )
+
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+            str(e)
+
+        }), 500
+
+
+# =========================================================
+# MARK NOTIFICATION SENT
+# =========================================================
+
+@app.route(
+    "/mark-notification-sent/<int:reminder_id>",
+    methods=["POST"]
+)
+def mark_notification(
+    reminder_id
+):
+
+    try:
+
+        success = (
+            mark_notification_sent(
+                reminder_id
+            )
+        )
+
+
+        if success:
+
+            return jsonify({
+
+                "success": True,
+
+                "message":
+                "Notification marked as sent."
+
+            })
+
+
+        return jsonify({
+
+            "success": False,
+
+            "message":
+            "Could not update reminder."
+
+        }), 500
+
+
+    except Exception as e:
+
+        print(
+            "Mark notification error:",
+            e
+        )
+
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+            str(e)
+
+        }), 500
+
+
+# =========================================================
+# RUN
 # =========================================================
 
 if __name__ == "__main__":
@@ -1001,6 +1310,7 @@ if __name__ == "__main__":
                 "PORT",
                 5000
             )
-        )
+        ),
 
+        debug=False
     )
