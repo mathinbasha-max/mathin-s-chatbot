@@ -5,14 +5,13 @@ import requests
 import os
 import time
 import uuid
+import re
 import dateparser
-from dateparser.search import search_dates
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 CORS(app)
-
 
 # =========================================================
 # TIMEZONE
@@ -48,7 +47,7 @@ def home():
 
 
 # =========================================================
-# CSS FILE
+# CSS
 # =========================================================
 
 @app.route("/style.css")
@@ -57,7 +56,7 @@ def style():
 
 
 # =========================================================
-# JAVASCRIPT FILE
+# JAVASCRIPT
 # =========================================================
 
 @app.route("/script.js")
@@ -80,7 +79,7 @@ def get_user_id():
 
 
 # =========================================================
-# GET PREVIOUS CHAT HISTORY
+# GET CHAT HISTORY
 # =========================================================
 
 def get_chat_history(user_id):
@@ -156,13 +155,9 @@ def save_reminder(
         supabase.table("reminders").insert({
 
             "user_id": user_id,
-
             "reminder_text": reminder_text,
-
             "reminder_date": reminder_date,
-
             "reminder_time": reminder_time,
-
             "completed": False
 
         }).execute()
@@ -177,144 +172,302 @@ def save_reminder(
 
 
 # =========================================================
-# CHECK WHETHER MESSAGE IS A REMINDER REQUEST
+# CHECK REMINDER REQUEST
 # =========================================================
 
 def is_reminder_request(question):
 
     text = question.lower().strip()
 
-    reminder_words = [
-        "remind me",
-        "set a reminder",
-        "set reminder",
-        "remember to remind me"
+    reminder_patterns = [
+        r"\bremind me\b",
+        r"\bcan you remind me\b",
+        r"\bplease remind me\b",
+        r"\bset a reminder\b",
+        r"\bset reminder\b"
     ]
 
-    return any(
-        word in text
-        for word in reminder_words
-    )
+    for pattern in reminder_patterns:
+
+        if re.search(pattern, text):
+            return True
+
+    return False
 
 
 # =========================================================
-# EXTRACT REMINDER DETAILS
+# EXTRACT TIME
+# =========================================================
+
+def extract_time(text):
+
+    # Supports:
+    # 7 PM
+    # 7:30 PM
+    # 7.30 PM
+    # 07:30 PM
+    # 19:30
+    # 7.30
+
+    time_pattern = re.compile(
+        r"\b("
+        r"(?:[0-1]?\d|2[0-3])"
+        r"(?:\s*[:.]\s*[0-5]\d)?"
+        r"\s*(?:AM|PM|am|pm)?"
+        r")\b"
+    )
+
+    match = time_pattern.search(text)
+
+    if not match:
+        return None, None
+
+    time_text = match.group(1).strip()
+
+    # Convert 7.30 → 7:30
+    normalized_time = time_text.replace(".", ":")
+
+    # If AM/PM is missing
+    # dateparser can still understand common values
+    parsed_time = dateparser.parse(
+        normalized_time,
+        settings={
+            "RETURN_AS_TIMEZONE_AWARE": False
+        }
+    )
+
+    if not parsed_time:
+        return None, None
+
+    return match, parsed_time
+
+
+# =========================================================
+# EXTRACT REMINDER
 # =========================================================
 
 def extract_reminder(question):
 
     try:
 
-        # Remove common reminder phrases
-        cleaned_question = question.strip()
-
-        prefixes = [
-            "remind me",
-            "set a reminder",
-            "set reminder"
-        ]
-
-        for prefix in prefixes:
-
-            if cleaned_question.lower().startswith(prefix):
-
-                cleaned_question = (
-                    cleaned_question[len(prefix):]
-                    .strip()
-                )
-
-                break
-
-
-        # Remove optional "to" before the actual task
-        if cleaned_question.lower().startswith("to "):
-
-            cleaned_question = cleaned_question[3:].strip()
-
-
-        # Current time in India
         now = datetime.now(INDIA_TZ)
 
+        original = question.strip()
 
-        # Find date/time inside the sentence
-        matches = search_dates(
+        # -------------------------------------------------
+        # Remove reminder command
+        # -------------------------------------------------
 
-            cleaned_question,
-
-            languages=["en"],
-
-            settings={
-                "RELATIVE_BASE": now,
-                "RETURN_AS_TIMEZONE_AWARE": True,
-                "PREFER_DATES_FROM": "future"
-            }
-        )
+        cleaned = re.sub(
+            r"^\s*(?:can you\s+|please\s+)?"
+            r"(?:remind me|set a reminder|set reminder)"
+            r"\s*",
+            "",
+            original,
+            flags=re.IGNORECASE
+        ).strip()
 
 
-        if not matches:
+        # -------------------------------------------------
+        # Find time
+        # -------------------------------------------------
+
+        time_match, parsed_time = extract_time(cleaned)
+
+        if not time_match:
 
             return None
 
+        time_text = time_match.group(1)
 
-        # Use the first detected date/time
-        matched_text, parsed_datetime = matches[0]
+        # -------------------------------------------------
+        # Remove time from sentence
+        # -------------------------------------------------
+
+        without_time = (
+            cleaned[:time_match.start()]
+            + " "
+            + cleaned[time_match.end():]
+        ).strip()
 
 
-        # Convert to India timezone
-        if parsed_datetime.tzinfo is None:
+        # -------------------------------------------------
+        # Find date words
+        # -------------------------------------------------
 
-            parsed_datetime = parsed_datetime.replace(
-                tzinfo=INDIA_TZ
+        date_patterns = [
+            r"\btoday\b",
+            r"\btomorrow\b",
+            r"\bday after tomorrow\b",
+            r"\bnext\s+(?:monday|tuesday|wednesday|"
+            r"thursday|friday|saturday|sunday)\b",
+            r"\bthis\s+(?:monday|tuesday|wednesday|"
+            r"thursday|friday|saturday|sunday)\b",
+            r"\bon\s+\d{1,2}(?:st|nd|rd|th)?\s+"
+            r"(?:january|february|march|april|may|june|"
+            r"july|august|september|october|november|december)\b",
+            r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+        ]
+
+        date_text = None
+        date_match = None
+
+        for pattern in date_patterns:
+
+            match = re.search(
+                pattern,
+                without_time,
+                flags=re.IGNORECASE
+            )
+
+            if match:
+
+                date_match = match
+                date_text = match.group(0)
+                break
+
+
+        # -------------------------------------------------
+        # If no date specified, use today
+        # -------------------------------------------------
+
+        if date_text:
+
+            parsed_date = dateparser.parse(
+                date_text,
+                settings={
+                    "RELATIVE_BASE": now,
+                    "PREFER_DATES_FROM": "future"
+                }
             )
 
         else:
 
-            parsed_datetime = parsed_datetime.astimezone(
-                INDIA_TZ
-            )
+            parsed_date = now
 
 
-        # Remove the detected date/time
-        # from the original reminder text
-        reminder_text = cleaned_question.replace(
-            matched_text,
-            ""
-        ).strip()
-
-
-        # Clean common leftover words
-        reminder_text = reminder_text.strip(" ,.-")
-
-
-        if reminder_text.lower().startswith("to "):
-
-            reminder_text = reminder_text[3:].strip()
-
-
-        if not reminder_text:
-
-            reminder_text = "Reminder"
-
-
-        # Make sure the reminder is in the future
-        if parsed_datetime <= now:
+        if not parsed_date:
 
             return None
 
 
+        # -------------------------------------------------
+        # Combine date + time
+        # -------------------------------------------------
+
+        hour = parsed_time.hour
+        minute = parsed_time.minute
+
+
+        # Detect AM/PM manually
+        if re.search(r"\bPM\b", time_text, re.IGNORECASE):
+
+            if hour < 12:
+                hour += 12
+
+        elif re.search(r"\bAM\b", time_text, re.IGNORECASE):
+
+            if hour == 12:
+                hour = 0
+
+        else:
+
+            # No AM/PM.
+            # Keep entered hour as-is.
+
+            pass
+
+
+        reminder_datetime = datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            hour,
+            minute,
+            0,
+            tzinfo=INDIA_TZ
+        )
+
+
+        # -------------------------------------------------
+        # If "today" time already passed,
+        # don't silently create a past reminder.
+        # -------------------------------------------------
+
+        if reminder_datetime <= now:
+
+            if date_text and date_text.lower() == "today":
+
+                return None
+
+
+        # -------------------------------------------------
+        # Remove date from task text
+        # -------------------------------------------------
+
+        task_text = without_time
+
+        if date_match:
+
+            task_text = (
+                task_text[:date_match.start()]
+                + " "
+                + task_text[date_match.end():]
+            )
+
+
+        # -------------------------------------------------
+        # Remove common words
+        # -------------------------------------------------
+
+        task_text = re.sub(
+            r"^\s*(?:at|on|for|to)\s+",
+            "",
+            task_text,
+            flags=re.IGNORECASE
+        )
+
+        task_text = re.sub(
+            r"\b(?:at|on)\s*$",
+            "",
+            task_text,
+            flags=re.IGNORECASE
+        )
+
+        task_text = task_text.strip(" ,.-")
+
+
+        # -------------------------------------------------
+        # Remove leading "to"
+        # -------------------------------------------------
+
+        if task_text.lower().startswith("to "):
+
+            task_text = task_text[3:].strip()
+
+
+        # -------------------------------------------------
+        # If task is empty
+        # -------------------------------------------------
+
+        if not task_text:
+
+            task_text = "Reminder"
+
+
         return {
 
-            "text": reminder_text,
+            "text": task_text,
 
-            "date": parsed_datetime.strftime(
+            "date": reminder_datetime.strftime(
                 "%Y-%m-%d"
             ),
 
-            "time": parsed_datetime.strftime(
+            "time": reminder_datetime.strftime(
                 "%H:%M:%S"
             ),
 
-            "datetime": parsed_datetime
+            "datetime": reminder_datetime
 
         }
 
@@ -330,6 +483,37 @@ def extract_reminder(question):
 
 
 # =========================================================
+# CREATE RESPONSE WITH COOKIE
+# =========================================================
+
+def create_response(user_id, answer):
+
+    response = make_response(
+        jsonify({
+            "reply": answer
+        })
+    )
+
+    response.set_cookie(
+
+        "chat_user_id",
+
+        user_id,
+
+        max_age=60 * 60 * 24 * 365 * 5,
+
+        httponly=True,
+
+        samesite="Lax",
+
+        secure=True
+
+    )
+
+    return response
+
+
+# =========================================================
 # CHAT API
 # =========================================================
 
@@ -337,10 +521,6 @@ def extract_reminder(question):
 def chat():
 
     try:
-
-        # -------------------------------------------------
-        # GET USER MESSAGE
-        # -------------------------------------------------
 
         data = request.get_json()
 
@@ -365,7 +545,7 @@ def chat():
 
 
         # -------------------------------------------------
-        # GET USER ID
+        # USER ID
         # -------------------------------------------------
 
         user_id = get_user_id()
@@ -380,17 +560,21 @@ def chat():
             reminder = extract_reminder(question)
 
 
-            # ---------------------------------------------
-            # Could not understand date/time
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # Reminder could not be understood
+            # -------------------------------------------------
 
             if not reminder:
 
                 answer = (
                     "I couldn't understand the reminder "
-                    "date or time. Please use a format like: "
-                    "\"Remind me tomorrow at 10 AM to "
-                    "submit my assignment.\""
+                    "date or time.\n\n"
+                    "Try something like:\n"
+                    "\"Remind me tomorrow at 10 AM "
+                    "to submit my assignment.\"\n\n"
+                    "You can also use:\n"
+                    "\"Remind me today at 8.30 PM "
+                    "to call my grandmother.\""
                 )
 
 
@@ -400,7 +584,6 @@ def chat():
                     question
                 )
 
-
                 save_message(
                     user_id,
                     "assistant",
@@ -408,35 +591,15 @@ def chat():
                 )
 
 
-                flask_response = make_response(
-                    jsonify({
-                        "reply": answer
-                    })
-                )
-
-
-                flask_response.set_cookie(
-
-                    "chat_user_id",
-
+                return create_response(
                     user_id,
-
-                    max_age=60 * 60 * 24 * 365 * 5,
-
-                    httponly=True,
-
-                    samesite="Lax",
-
-                    secure=True
+                    answer
                 )
 
 
-                return flask_response
-
-
-            # ---------------------------------------------
+            # -------------------------------------------------
             # SAVE REMINDER
-            # ---------------------------------------------
+            # -------------------------------------------------
 
             saved = save_reminder(
 
@@ -453,23 +616,26 @@ def chat():
 
             if not saved:
 
-                return jsonify({
+                answer = (
+                    "I understood your reminder, "
+                    "but I couldn't save it to the database."
+                )
 
-                    "reply":
-                    "I understood the reminder, "
-                    "but I couldn't save it. "
-                    "Please try again."
-
-                }), 500
+                return create_response(
+                    user_id,
+                    answer
+                )
 
 
-            # ---------------------------------------------
-            # FORMAT DISPLAY TIME
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # DISPLAY DATE/TIME
+            # -------------------------------------------------
 
             display_datetime = (
                 reminder["datetime"]
-                .strftime("%d %b %Y at %I:%M %p")
+                .strftime(
+                    "%d %b %Y at %I:%M %p"
+                )
             )
 
 
@@ -480,16 +646,15 @@ def chat():
             )
 
 
-            # ---------------------------------------------
-            # SAVE CHAT HISTORY TOO
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # SAVE TO CHAT MEMORY
+            # -------------------------------------------------
 
             save_message(
                 user_id,
                 "user",
                 question
             )
-
 
             save_message(
                 user_id,
@@ -498,30 +663,10 @@ def chat():
             )
 
 
-            flask_response = make_response(
-                jsonify({
-                    "reply": answer
-                })
-            )
-
-
-            flask_response.set_cookie(
-
-                "chat_user_id",
-
+            return create_response(
                 user_id,
-
-                max_age=60 * 60 * 24 * 365 * 5,
-
-                httponly=True,
-
-                samesite="Lax",
-
-                secure=True
+                answer
             )
-
-
-            return flask_response
 
 
         # =================================================
@@ -530,10 +675,6 @@ def chat():
 
         history = get_chat_history(user_id)
 
-
-        # -------------------------------------------------
-        # BUILD CONVERSATION
-        # -------------------------------------------------
 
         conversation_text = ""
 
@@ -559,7 +700,6 @@ def chat():
                     + "\n"
                 )
 
-
             elif role == "assistant":
 
                 conversation_text += (
@@ -578,7 +718,7 @@ You are a helpful AI chatbot.
 
 You have access to the previous conversation with this user.
 
-Use the previous conversation when it is relevant.
+Use previous information when it is relevant.
 
 Previous conversation:
 {conversation_text}
@@ -611,23 +751,16 @@ Answer the current user message naturally and accurately.
 
 
         # -------------------------------------------------
-        # GEMINI API URL
+        # GEMINI URL
         # -------------------------------------------------
 
         url = (
-
             "https://generativelanguage.googleapis.com/"
-
             "v1beta/models/"
             "gemini-3.6-flash:"
             "generateContent"
-
         )
 
-
-        # -------------------------------------------------
-        # GEMINI PAYLOAD
-        # -------------------------------------------------
 
         payload = {
 
@@ -673,6 +806,7 @@ Answer the current user message naturally and accurately.
                 json=payload,
 
                 timeout=60
+
             )
 
 
@@ -694,86 +828,31 @@ Answer the current user message naturally and accurately.
                 try:
 
                     answer = (
-
                         result["candidates"][0]
-
                         ["content"]
-
                         ["parts"][0]
-
                         ["text"]
-
                     ).strip()
 
 
-                    # -----------------------------------------
-                    # SAVE USER MESSAGE
-                    # -----------------------------------------
-
                     save_message(
-
                         user_id,
-
                         "user",
-
                         question
-
                     )
 
-
-                    # -----------------------------------------
-                    # SAVE AI RESPONSE
-                    # -----------------------------------------
 
                     save_message(
-
                         user_id,
-
                         "assistant",
-
                         answer
-
                     )
 
 
-                    # -----------------------------------------
-                    # CREATE RESPONSE
-                    # -----------------------------------------
-
-                    flask_response = make_response(
-
-                        jsonify({
-
-                            "reply":
-                            answer
-
-                        })
-
-                    )
-
-
-                    # -----------------------------------------
-                    # SAVE USER ID COOKIE
-                    # -----------------------------------------
-
-                    flask_response.set_cookie(
-
-                        "chat_user_id",
-
+                    return create_response(
                         user_id,
-
-                        max_age=60 * 60 * 24 * 365 * 5,
-
-                        httponly=True,
-
-                        samesite="Lax",
-
-                        secure=True
-
+                        answer
                     )
-
-
-                    return flask_response
 
 
                 except (
@@ -792,24 +871,20 @@ Answer the current user message naturally and accurately.
 
 
             # -------------------------------------------------
-            # TEMPORARY 503 ERROR
+            # 503 RETRY
             # -------------------------------------------------
 
             if response.status_code == 503:
 
                 print(
-
                     f"Gemini is busy. "
                     f"Retry attempt "
                     f"{attempt + 1}/3"
-
                 )
-
 
                 time.sleep(
                     2 ** attempt
                 )
-
 
                 continue
 
@@ -821,28 +896,18 @@ Answer the current user message naturally and accurately.
             error_message = (
 
                 result
-
+                .get("error", {})
                 .get(
-                    "error",
-                    {}
-                )
-
-                .get(
-
                     "message",
-
                     "Unknown Gemini API error"
-
                 )
 
             )
 
 
             print(
-
                 "GEMINI ERROR:",
                 error_message
-
             )
 
 
@@ -855,9 +920,9 @@ Answer the current user message naturally and accurately.
             }), 500
 
 
-        # =================================================
+        # -------------------------------------------------
         # ALL RETRIES FAILED
-        # =================================================
+        # -------------------------------------------------
 
         return jsonify({
 
@@ -894,7 +959,6 @@ Answer the current user message naturally and accurately.
             e
         )
 
-
         return jsonify({
 
             "reply":
@@ -904,7 +968,7 @@ Answer the current user message naturally and accurately.
 
 
     # =====================================================
-    # OTHER SERVER ERROR
+    # OTHER ERROR
     # =====================================================
 
     except Exception as e:
@@ -913,7 +977,6 @@ Answer the current user message naturally and accurately.
             "SERVER ERROR:",
             e
         )
-
 
         return jsonify({
 
@@ -934,12 +997,10 @@ if __name__ == "__main__":
         host="0.0.0.0",
 
         port=int(
-
             os.environ.get(
                 "PORT",
                 5000
             )
-
         )
 
     )
