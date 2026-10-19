@@ -4,3 +4,4 @@ requests
 gunicorn
 supabase
 dateparser
+python-dotenv
