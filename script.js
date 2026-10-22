@@ -1,343 +1,173 @@
-// =========================================================
-// CHAT FUNCTION
-// =========================================================
 
+const input = document.getElementById("message");
+const chat = document.getElementById("chat");
+const sendButton = document.getElementById("sendButton");
+const enableNotificationsButton =
+    document.getElementById("enableNotifications");
+const notificationStatus =
+    document.getElementById("notificationStatus");
+
+let reminderCheckRunning = false;
+
+// Safely display chat text
+function addMessage(text, type) {
+    const wrapper = document.createElement("div");
+    wrapper.className = `message ${type}-message`;
+
+    const content = document.createElement("div");
+    content.className = "message-content";
+    content.textContent = text;
+
+    wrapper.appendChild(content);
+    chat.appendChild(wrapper);
+    chat.scrollTop = chat.scrollHeight;
+}
+
+// Send chat message
 async function sendMessage() {
-
-    const input = document.getElementById("message");
-    const chat = document.getElementById("chat");
-
     const message = input.value.trim();
 
-    if (!message) {
-        return;
-    }
+    if (!message) return;
 
-
-    // Show user message
-
-    chat.innerHTML += `
-        <div class="message user-message">
-            <div class="message-content">
-                ${message}
-            </div>
-        </div>
-    `;
-
-
+    addMessage(message, "user");
     input.value = "";
-
-    chat.scrollTop = chat.scrollHeight;
-
+    sendButton.disabled = true;
 
     try {
-
         const response = await fetch("/chat", {
-
             method: "POST",
-
             headers: {
                 "Content-Type": "application/json"
             },
-
-            body: JSON.stringify({
-                message: message
-            })
-
+            body: JSON.stringify({ message })
         });
-
 
         const data = await response.json();
 
+        if (!response.ok) {
+            throw new Error(data.error || "Chat request failed");
+        }
 
-        // Show AI response
-
-        chat.innerHTML += `
-            <div class="message bot-message">
-                <div class="message-content">
-                    ${data.reply}
-                </div>
-            </div>
-        `;
-
-
-        chat.scrollTop = chat.scrollHeight;
-
-
+        addMessage(data.reply || "No reply received.", "bot");
     } catch (error) {
-
-        console.error(
-            "Chat error:",
-            error
+        console.error("Chat error:", error);
+        addMessage(
+            "❌ Unable to connect to AI server. Please try again.",
+            "bot"
         );
-
-
-        chat.innerHTML += `
-            <div class="message bot-message">
-                <div class="message-content">
-                    ❌ Unable to connect to AI server.
-                </div>
-            </div>
-        `;
-
+    } finally {
+        sendButton.disabled = false;
+        input.focus();
     }
-
 }
 
+sendButton.addEventListener("click", sendMessage);
 
-// =========================================================
-// ENTER KEY
-// =========================================================
+input.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+        event.preventDefault();
+        sendMessage();
+    }
+});
 
-const messageInput =
-    document.getElementById("message");
-
-
-if (messageInput) {
-
-    messageInput.addEventListener(
-        "keydown",
-        function(event) {
-
-            if (event.key === "Enter") {
-
-                event.preventDefault();
-
-                sendMessage();
-
-            }
-
-        }
-    );
-
-}
-
-
-// =========================================================
-// REQUEST NOTIFICATION PERMISSION
-// =========================================================
-
-async function requestNotificationPermission() {
-
+// Enable browser notifications after a user click
+enableNotificationsButton.addEventListener("click", async () => {
     if (!("Notification" in window)) {
-
-        console.log(
-            "Browser notifications are not supported."
-        );
-
-        return;
-
-    }
-
-
-    if (Notification.permission === "default") {
-
-        try {
-
-            await Notification.requestPermission();
-
-        } catch (error) {
-
-            console.log(
-                "Notification permission error:",
-                error
-            );
-
-        }
-
-    }
-
-}
-
-
-// =========================================================
-// SHOW BROWSER NOTIFICATION
-// =========================================================
-
-function showReminderNotification(
-    reminder
-) {
-
-    if (!("Notification" in window)) {
+        notificationStatus.textContent =
+            "This browser does not support notifications.";
         return;
     }
-
-
-    if (Notification.permission !== "granted") {
-        return;
-    }
-
-
-    const title =
-        "⏰ Reminder";
-
-
-    const body =
-        reminder.text ||
-        "You have a reminder.";
-
 
     try {
+        const permission = await Notification.requestPermission();
 
-        const notification =
-            new Notification(
-                title,
-                {
-                    body: body,
-                    icon: "/favicon.ico"
-                }
-            );
-
-
-        notification.onclick =
-            function() {
-
-                window.focus();
-
-                notification.close();
-
-            };
-
-
+        if (permission === "granted") {
+            notificationStatus.textContent =
+                "✅ Notifications enabled!";
+            enableNotificationsButton.textContent =
+                "✅ Notifications Enabled";
+            await checkReminders();
+        } else {
+            notificationStatus.textContent =
+                "Notifications blocked. Allow them in browser site settings.";
+        }
     } catch (error) {
-
-        console.log(
-            "Notification error:",
-            error
-        );
-
+        console.error("Permission error:", error);
+        notificationStatus.textContent =
+            "Could not enable notifications.";
     }
+});
 
+// Display one reminder notification
+function showReminderNotification(reminder) {
+    if (!("Notification" in window)) return false;
+    if (Notification.permission !== "granted") return false;
+
+    try {
+        const notification = new Notification("⏰ My AI Chatbot Reminder", {
+            body: reminder.text || "You have a reminder."
+        });
+
+        notification.onclick = () => {
+            window.focus();
+            notification.close();
+        };
+
+        return true;
+    } catch (error) {
+        console.error("Notification error:", error);
+        return false;
+    }
 }
 
-
-// =========================================================
-// CHECK DUE REMINDERS
-// =========================================================
-
+// Check due reminders on the backend
 async function checkReminders() {
+    if (reminderCheckRunning) return;
+    reminderCheckRunning = true;
 
     try {
-
-        const response =
-            await fetch(
-                "/check-reminders"
-            );
-
+        const response = await fetch("/check-reminders", {
+            cache: "no-store"
+        });
 
         if (!response.ok) {
-
-            console.log(
-                "Reminder checker failed."
-            );
-
-            return;
-
+            throw new Error("Reminder check failed");
         }
 
+        const data = await response.json();
 
-        const data =
-            await response.json();
+        if (!data.success) return;
 
+        for (const reminder of (data.reminders || [])) {
+            // Do not mark as sent if permission is missing
+            const sent = showReminderNotification(reminder);
 
-        if (!data.success) {
+            if (!sent) continue;
 
-            console.log(
-                "Reminder checker returned an error."
+            const markResponse = await fetch(
+                `/mark-notification-sent/${reminder.id}`,
+                { method: "POST" }
             );
 
-            return;
-
-        }
-
-
-        const reminders =
-            data.reminders || [];
-
-
-        if (reminders.length === 0) {
-
-            return;
-
-        }
-
-
-        // Process each due reminder
-
-        for (
-            const reminder of reminders
-        ) {
-
-            // Show notification
-
-            showReminderNotification(
-                reminder
-            );
-
-
-            // Tell backend that notification
-            // has been processed
-
-            try {
-
-                await fetch(
-                    `/mark-notification-sent/${reminder.id}`,
-                    {
-                        method: "POST"
-                    }
+            if (!markResponse.ok) {
+                console.error(
+                    "Could not mark reminder as sent:",
+                    reminder.id
                 );
-
-            } catch (error) {
-
-                console.log(
-                    "Could not mark reminder:",
-                    error
-                );
-
             }
-
         }
-
     } catch (error) {
-
-        console.log(
-            "Reminder check error:",
-            error
-        );
-
+        console.error("Reminder check error:", error);
+    } finally {
+        reminderCheckRunning = false;
     }
-
 }
 
-
-// =========================================================
-// START REMINDER SYSTEM
-// =========================================================
-
-async function startReminderSystem() {
-
-    // Ask user for notification permission
-
-    await requestNotificationPermission();
-
-
-    // Check immediately
-
-    await checkReminders();
-
-
-    // Check every 30 seconds
-
-    setInterval(
-        checkReminders,
-        30000
-    );
-
+// Start checking reminders while the page is open
+if ("Notification" in window &&
+    Notification.permission === "granted") {
+    notificationStatus.textContent = "✅ Notifications are enabled.";
 }
 
-
-// =========================================================
-// START
-// =========================================================
-
-startReminderSystem();
+checkReminders();
+setInterval(checkReminders, 30000);
