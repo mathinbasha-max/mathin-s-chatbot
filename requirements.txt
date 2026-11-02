@@ -1,3 +1,4 @@
+
 flask
 flask-cors
 requests
@@ -5,3 +6,5 @@ gunicorn
 supabase
 dateparser
 python-dotenv
+pywebpush
+py-vapid
