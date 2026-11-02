@@ -5,6 +5,8 @@ import os
 import uuid
 import re
 import time
+import json
+from pywebpush import webpush, WebPushException
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from supabase import create_client
@@ -37,6 +39,18 @@ IST = ZoneInfo("Asia/Kolkata")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:your-email@example.com")
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+# pywebpush accepts a PEM key file path. Write the Render environment value
+# to a temporary file at startup; do not commit this private key to GitHub.
+VAPID_PRIVATE_KEY_PATH = None
+if VAPID_PRIVATE_KEY:
+    VAPID_PRIVATE_KEY_PATH = "/tmp/chatbot_vapid_private.pem"
+    with open(VAPID_PRIVATE_KEY_PATH, "w", encoding="utf-8") as key_file:
+        key_file.write(VAPID_PRIVATE_KEY.replace("\\n", "\n"))
 
 
 # =========================================================
@@ -682,6 +696,148 @@ def javascript():
         ".",
         "script.js"
     )
+
+
+
+@app.route("/service-worker.js")
+def service_worker():
+
+    response = make_response(send_from_directory(".", "service-worker.js"))
+    response.headers["Service-Worker-Allowed"] = "/"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.route("/vapid-public-key")
+def vapid_public_key():
+
+    if not VAPID_PUBLIC_KEY:
+        return jsonify({"success": False, "error": "VAPID public key is not configured."}), 503
+
+    return jsonify({"success": True, "publicKey": VAPID_PUBLIC_KEY})
+
+
+@app.route("/subscribe", methods=["POST"])
+def subscribe_push():
+
+    if not supabase:
+        return jsonify({"success": False, "error": "Supabase is not configured."}), 503
+
+    data = request.get_json(silent=True) or {}
+    subscription = data.get("subscription")
+
+    if not isinstance(subscription, dict) or not subscription.get("endpoint"):
+        return jsonify({"success": False, "error": "Invalid push subscription."}), 400
+
+    user_id = get_user_id()
+
+    try:
+        # One subscription per browser endpoint; remove old duplicate before inserting.
+        supabase.table("push_subscriptions").delete().eq(
+            "user_id", user_id
+        ).eq("endpoint", subscription["endpoint"]).execute()
+
+        supabase.table("push_subscriptions").insert({
+            "user_id": user_id,
+            "endpoint": subscription["endpoint"],
+            "subscription": subscription
+        }).execute()
+
+        response = make_response(jsonify({"success": True, "message": "Push notifications enabled."}))
+        response.set_cookie(
+            "chat_user_id",
+            user_id,
+            max_age=60 * 60 * 24 * 365,
+            httponly=True,
+            samesite="Lax",
+            secure=request.is_secure
+        )
+        return response
+
+    except Exception as e:
+        print("Push subscription save error:", e)
+        return jsonify({"success": False, "error": "Could not save push subscription."}), 500
+
+
+@app.route("/process-reminders", methods=["POST"])
+def process_reminders():
+
+    # Called by a scheduled workflow, not by the browser.
+    if not CRON_SECRET or request.headers.get("X-Cron-Secret") != CRON_SECRET:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    if not VAPID_PRIVATE_KEY_PATH or not VAPID_PUBLIC_KEY:
+        return jsonify({"success": False, "error": "VAPID keys are not configured."}), 503
+
+    if not supabase:
+        return jsonify({"success": False, "error": "Supabase is not configured."}), 503
+
+    due_reminders = get_due_reminders()
+    sent_count = 0
+    skipped_count = 0
+
+    for reminder in due_reminders:
+        user_id = reminder.get("user_id")
+        reminder_id = reminder.get("id")
+
+        try:
+            result = supabase.table("push_subscriptions").select(
+                "id,subscription"
+            ).eq("user_id", user_id).execute()
+            subscriptions = result.data or []
+        except Exception as e:
+            print("Push subscription lookup error:", e)
+            skipped_count += 1
+            continue
+
+        delivered = False
+
+        for item in subscriptions:
+            subscription = item.get("subscription")
+            if not isinstance(subscription, dict):
+                continue
+
+            payload = {
+                "title": "⏰ My AI Chatbot Reminder",
+                "body": reminder.get("reminder_text") or "You have a reminder.",
+                "url": "/"
+            }
+
+            try:
+                webpush(
+                    subscription_info=subscription,
+                    data=json.dumps(payload),
+                    vapid_private_key=VAPID_PRIVATE_KEY_PATH,
+                    vapid_claims={"sub": VAPID_SUBJECT}
+                )
+                delivered = True
+
+            except WebPushException as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                print("Web push error:", status, str(e))
+                if status in (404, 410):
+                    try:
+                        supabase.table("push_subscriptions").delete().eq(
+                            "id", item["id"]
+                        ).execute()
+                    except Exception as cleanup_error:
+                        print("Stale subscription cleanup error:", cleanup_error)
+
+            except Exception as e:
+                print("Unexpected push error:", e)
+
+        # Mark as sent only after at least one browser accepted the push.
+        if delivered and mark_notification_sent(reminder_id):
+            sent_count += 1
+        else:
+            skipped_count += 1
+
+    return jsonify({
+        "success": True,
+        "due": len(due_reminders),
+        "sent": sent_count,
+        "skipped": skipped_count
+    })
 
 
 # =========================================================
