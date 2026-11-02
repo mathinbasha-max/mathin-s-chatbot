@@ -1,32 +1,22 @@
-
 const input = document.getElementById("message");
 const chat = document.getElementById("chat");
 const sendButton = document.getElementById("sendButton");
-const enableNotificationsButton =
-    document.getElementById("enableNotifications");
-const notificationStatus =
-    document.getElementById("notificationStatus");
+const enableNotificationsButton = document.getElementById("enableNotifications");
+const notificationStatus = document.getElementById("notificationStatus");
 
-let reminderCheckRunning = false;
-
-// Safely display chat text
 function addMessage(text, type) {
     const wrapper = document.createElement("div");
     wrapper.className = `message ${type}-message`;
-
     const content = document.createElement("div");
     content.className = "message-content";
     content.textContent = text;
-
     wrapper.appendChild(content);
     chat.appendChild(wrapper);
     chat.scrollTop = chat.scrollHeight;
 }
 
-// Send chat message
 async function sendMessage() {
     const message = input.value.trim();
-
     if (!message) return;
 
     addMessage(message, "user");
@@ -36,25 +26,15 @@ async function sendMessage() {
     try {
         const response = await fetch("/chat", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ message })
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({message})
         });
-
         const data = await response.json();
-
-        if (!response.ok) {
-            throw new Error(data.error || "Chat request failed");
-        }
-
+        if (!response.ok) throw new Error(data.error || "Chat request failed");
         addMessage(data.reply || "No reply received.", "bot");
     } catch (error) {
         console.error("Chat error:", error);
-        addMessage(
-            "❌ Unable to connect to AI server. Please try again.",
-            "bot"
-        );
+        addMessage("❌ Unable to connect to AI server. Please try again.", "bot");
     } finally {
         sendButton.disabled = false;
         input.focus();
@@ -62,7 +42,6 @@ async function sendMessage() {
 }
 
 sendButton.addEventListener("click", sendMessage);
-
 input.addEventListener("keydown", event => {
     if (event.key === "Enter") {
         event.preventDefault();
@@ -70,104 +49,67 @@ input.addEventListener("keydown", event => {
     }
 });
 
-// Enable browser notifications after a user click
-enableNotificationsButton.addEventListener("click", async () => {
-    if (!("Notification" in window)) {
-        notificationStatus.textContent =
-            "This browser does not support notifications.";
+function urlBase64ToUint8Array(base64String) {
+    const padding = "=".repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const rawData = atob(base64);
+    return Uint8Array.from([...rawData].map(char => char.charCodeAt(0)));
+}
+
+async function enablePushNotifications() {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+        notificationStatus.textContent = "This browser does not support web push notifications.";
         return;
     }
 
+    enableNotificationsButton.disabled = true;
     try {
         const permission = await Notification.requestPermission();
-
-        if (permission === "granted") {
-            notificationStatus.textContent =
-                "✅ Notifications enabled!";
-            enableNotificationsButton.textContent =
-                "✅ Notifications Enabled";
-            await checkReminders();
-        } else {
-            notificationStatus.textContent =
-                "Notifications blocked. Allow them in browser site settings.";
+        if (permission !== "granted") {
+            notificationStatus.textContent = "Notifications are blocked. Allow them in browser site settings and try again.";
+            return;
         }
-    } catch (error) {
-        console.error("Permission error:", error);
-        notificationStatus.textContent =
-            "Could not enable notifications.";
-    }
-});
 
-// Display one reminder notification
-function showReminderNotification(reminder) {
-    if (!("Notification" in window)) return false;
-    if (Notification.permission !== "granted") return false;
+        const registration = await navigator.serviceWorker.register("/service-worker.js");
+        await navigator.serviceWorker.ready;
 
-    try {
-        const notification = new Notification("⏰ My AI Chatbot Reminder", {
-            body: reminder.text || "You have a reminder."
+        const keyResponse = await fetch("/vapid-public-key", {cache: "no-store"});
+        const keyData = await keyResponse.json();
+        if (!keyResponse.ok || !keyData.success || !keyData.publicKey) {
+            throw new Error(keyData.error || "VAPID public key is missing on the server.");
+        }
+
+        let subscription = await registration.pushManager.getSubscription();
+        if (!subscription) {
+            subscription = await registration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
+            });
+        }
+
+        const saveResponse = await fetch("/subscribe", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({subscription: subscription.toJSON()})
         });
+        const saveData = await saveResponse.json();
 
-        notification.onclick = () => {
-            window.focus();
-            notification.close();
-        };
-
-        return true;
-    } catch (error) {
-        console.error("Notification error:", error);
-        return false;
-    }
-}
-
-// Check due reminders on the backend
-async function checkReminders() {
-    if (reminderCheckRunning) return;
-    reminderCheckRunning = true;
-
-    try {
-        const response = await fetch("/check-reminders", {
-            cache: "no-store"
-        });
-
-        if (!response.ok) {
-            throw new Error("Reminder check failed");
+        if (!saveResponse.ok || !saveData.success) {
+            throw new Error(saveData.error || "Could not save subscription.");
         }
 
-        const data = await response.json();
-
-        if (!data.success) return;
-
-        for (const reminder of (data.reminders || [])) {
-            // Do not mark as sent if permission is missing
-            const sent = showReminderNotification(reminder);
-
-            if (!sent) continue;
-
-            const markResponse = await fetch(
-                `/mark-notification-sent/${reminder.id}`,
-                { method: "POST" }
-            );
-
-            if (!markResponse.ok) {
-                console.error(
-                    "Could not mark reminder as sent:",
-                    reminder.id
-                );
-            }
-        }
+        notificationStatus.textContent = "✅ Push notifications enabled. You can close this page after setting a reminder.";
+        enableNotificationsButton.textContent = "✅ Reminders Enabled";
     } catch (error) {
-        console.error("Reminder check error:", error);
+        console.error("Enable push error:", error);
+        notificationStatus.textContent = "❌ Could not enable push notifications: " + error.message;
     } finally {
-        reminderCheckRunning = false;
+        enableNotificationsButton.disabled = false;
     }
 }
 
-// Start checking reminders while the page is open
-if ("Notification" in window &&
-    Notification.permission === "granted") {
-    notificationStatus.textContent = "✅ Notifications are enabled.";
-}
+enableNotificationsButton.addEventListener("click", enablePushNotifications);
 
-checkReminders();
-setInterval(checkReminders, 30000);
+if ("serviceWorker" in navigator && "Notification" in window && Notification.permission === "granted") {
+    notificationStatus.textContent = "Notifications permission is allowed. Click Enable Reminders if you haven't subscribed this browser yet.";
+}
