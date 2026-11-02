@@ -1,0 +1,23 @@
+name: Process chatbot reminders
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  process-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask Render to send due push notifications
+        env:
+          REMINDER_ENDPOINT: ${{ secrets.REMINDER_ENDPOINT }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$REMINDER_ENDPOINT" ] || [ -z "$CRON_SECRET" ]; then
+            echo "REMINDER_ENDPOINT and CRON_SECRET repository secrets must be configured."
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 60 \
+            -X POST "$REMINDER_ENDPOINT" \
+            -H "X-Cron-Secret: $CRON_SECRET"
